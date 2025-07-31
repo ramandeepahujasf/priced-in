@@ -9,6 +9,37 @@ import { z } from "zod";
 invariant(process.env.OPENAI_API_KEY, "OPENAI_API_KEY is not set");
 const client = new OpenAI();
 
+// Rate limiting utility
+let lastApiCall = 0;
+const MIN_API_CALL_INTERVAL = 3000; // 3 seconds between API calls
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const rateLimitedApiCall = async <T>(apiCall: () => Promise<T>): Promise<T> => {
+  const now = Date.now();
+  const timeSinceLastCall = now - lastApiCall;
+  
+  if (timeSinceLastCall < MIN_API_CALL_INTERVAL) {
+    const waitTime = MIN_API_CALL_INTERVAL - timeSinceLastCall;
+    log(`⏳ Rate limiting: waiting ${waitTime}ms before next API call`);
+    await delay(waitTime);
+  }
+  
+  lastApiCall = Date.now();
+  
+  try {
+    return await apiCall();
+  } catch (error: any) {
+    if (error?.status === 429) {
+      log(`🚫 Rate limit hit, waiting 2 seconds before retry...`);
+      await delay(2000);
+      lastApiCall = Date.now();
+      return await apiCall();
+    }
+    throw error;
+  }
+};
+
 const log = (message: string) => {
   message = `[${new Date().toISOString()}] ${message}`;
   console.log(message);
@@ -31,23 +62,27 @@ const portfolioSchema = z.object({
 });
 
 const webSearch = async (query: string): Promise<string> => {
-  const response = await client.responses.create({
-    model: "gpt-4.1-mini",
-    input: `Please use web search to answer this query from the user and respond with a short summary in markdown of what you found:\n\n${query}`,
-    tools: [{ type: "web_search_preview" }],
+  return rateLimitedApiCall(async () => {
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: `Please use web search to answer this query from the user and respond with a short summary in markdown of what you found:\n\n${query}`,
+      tools: [{ type: "web_search_preview" }],
+    });
+    return response.output_text;
   });
-  return response.output_text;
 };
 
 const getStockPrice = async (ticker: string): Promise<number> => {
-  const response = await client.responses.parse({
-    model: "gpt-4.1-mini",
-    input: `What is the current price of the stock ticker $${ticker}? Please use web search to get the latest price and then answer in short.`,
-    tools: [{ type: "web_search_preview" }],
-    text: { format: zodTextFormat(z.object({ price: z.number() }), "price") },
+  return rateLimitedApiCall(async () => {
+    const response = await client.responses.parse({
+      model: "gpt-4.1-mini",
+      input: `What is the current price of the stock ticker $${ticker}? Please use web search to get the latest price and then answer in short.`,
+      tools: [{ type: "web_search_preview" }],
+      text: { format: zodTextFormat(z.object({ price: z.number() }), "price") },
+    });
+    if (!response.output_parsed) throw new Error("Failed to get stock price");
+    return response.output_parsed.price;
   });
-  if (!response.output_parsed) throw new Error("Failed to get stock price");
-  return response.output_parsed.price;
 };
 
 const getPortfolio = async (): Promise<z.infer<typeof portfolioSchema>> => {
@@ -210,6 +245,8 @@ const calculateNetWorth = async (): Promise<number> => {
       try {
         const price = await getStockPrice(ticker);
         totalHoldingsValue += shares * price;
+        // Add small delay between multiple stock price calls
+        await delay(1000);
       } catch (error) {
         log(`⚠️ Failed to get price for ${ticker}: ${error}`);
       }
@@ -241,6 +278,8 @@ const calculateAnnualizedReturn = async (
       try {
         const price = await getStockPrice(ticker);
         totalHoldingsValue += shares * price;
+        // Add small delay between multiple stock price calls
+        await delay(1000);
       } catch (error) {
         log(`⚠️ Failed to get price for ${ticker}: ${error}`);
       }
@@ -283,6 +322,8 @@ const calculatePortfolioValue = async (): Promise<{
         const value = Math.round(shares * price * 100) / 100;
         holdingsWithValues[ticker] = { shares, value };
         totalHoldingsValue += value;
+        // Add small delay between multiple stock price calls
+        await delay(1000);
       } catch (error) {
         log(`⚠️ Failed to get price for ${ticker}: ${error}`);
         holdingsWithValues[ticker] = { shares, value: 0 };
@@ -391,6 +432,10 @@ const agent = new Agent({
 });
 
 log("Starting agent");
+
+// Add initial delay to avoid rate limiting
+log("⏳ Adding initial delay to prevent rate limiting...");
+await delay(5000);
 
 const thread = await loadThread();
 const result = await run(
